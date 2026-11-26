@@ -990,3 +990,61 @@ mod waiter_tests {
         assert!(!peers.contains_key("pair"));
     }
 }
+
+
+
+#[cfg(test)]
+mod managed_relay_probe_tests {
+    use super::*;
+    use hbbs::managed_relay_probe::{probe, RelayPublicKey, RelayTarget};
+
+    async fn serve_pairing(key: String) -> (RelayTarget, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = RelayTarget::parse(&listener.local_addr().unwrap().to_string()).unwrap();
+        // Exercise the real pairing implementation. The production loopback TCP
+        // listener intentionally routes local connections to the admin console.
+        let task = tokio::spawn(async move {
+            while let Ok((stream, addr)) = listener.accept().await {
+                let key = key.clone();
+                tokio::spawn(async move {
+                    allow_err!(make_pair(stream, addr, &key, Limiter::new(f64::INFINITY), false).await);
+                });
+            }
+        });
+        (target, task)
+    }
+
+    #[tokio::test]
+    async fn probe_exchanges_data_through_native_relay_and_checks_key() {
+        let key = base64::encode([42u8; 32]);
+        let (target, server) = serve_pairing(key.clone()).await;
+        assert!(probe(&target, &RelayPublicKey::parse(&key).unwrap()).await.is_ok());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn probe_rejects_wrong_key_and_unkeyed_relay() {
+        let key = base64::encode([42u8; 32]);
+        let (target, server) = serve_pairing(key).await;
+        let wrong = RelayPublicKey::parse(&base64::encode([43u8; 32])).unwrap();
+        assert!(probe(&target, &wrong).await.is_err());
+        server.abort();
+        let (target, server) = serve_pairing(String::new()).await;
+        assert!(probe(&target, &wrong).await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn tcp_listener_alone_does_not_pass_protocol_probe() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = RelayTarget::parse(&listener.local_addr().unwrap().to_string()).unwrap();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                drop(stream);
+            }
+        });
+        let key = RelayPublicKey::parse(&base64::encode([42u8; 32])).unwrap();
+        assert!(probe(&target, &key).await.is_err());
+        task.abort();
+    }
+}
