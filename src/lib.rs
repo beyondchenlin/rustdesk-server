@@ -6,3 +6,6 @@ mod peer;
 mod version;
 
 pub mod managed_relay_probe;
+pub mod managed_relay_store;
+pub mod managed_relay_runtime;
+pub mod managed_relay_admin;

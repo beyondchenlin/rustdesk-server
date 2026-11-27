@@ -111,6 +111,10 @@ impl RelayPublicKey {
         Self::parse(&contents)
     }
 
+    pub(crate) fn equals_key_bytes(&self, bytes: &[u8]) -> bool {
+        self.0 == base64::encode(bytes)
+    }
+
     fn different_key(&self) -> ResultType<String> {
         let mut bytes = base64::decode(&self.0)?;
         let first = bytes.first_mut().context("Empty relay public key")?;

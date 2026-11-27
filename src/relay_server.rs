@@ -1048,3 +1048,115 @@ mod managed_relay_probe_tests {
         task.abort();
     }
 }
+
+
+
+#[cfg(test)]
+mod managed_relay_runtime_tests {
+    use super::*;
+    use hbbs::{
+        managed_relay_probe::{RelayPublicKey, RelayTarget},
+        managed_relay_runtime::ManagedRelayRuntime,
+        managed_relay_store::RelayPoolStore,
+    };
+
+    async fn native_node(key: String) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let task = tokio::spawn(async move {
+            while let Ok((stream, addr)) = listener.accept().await {
+                let key = key.clone();
+                tokio::spawn(async move {
+                    allow_err!(make_pair(stream, addr, &key, Limiter::new(f64::INFINITY), false).await);
+                });
+            }
+        });
+        (address, task)
+    }
+
+    #[tokio::test]
+    async fn managed_pool_switches_real_relays_degrades_and_rolls_back() {
+        let key = base64::encode([71u8; 32]);
+        let (first, first_task) = native_node(key.clone()).await;
+        let (second, second_task) = native_node(key.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pool.sqlite3");
+        let store = RelayPoolStore::initialize(&path, &[first.clone()], "test").await.unwrap();
+        let runtime = ManagedRelayRuntime::open(store.clone(), RelayPublicKey::parse(&key).unwrap()).await.unwrap();
+        assert_eq!(runtime.select(), Some(first.clone()));
+
+        let changed = runtime.publish(1, &[second.clone()], "test").await.unwrap();
+        assert_eq!(changed.current.revision, 2);
+        assert_eq!(runtime.select(), Some(second.clone()));
+        assert!(runtime.publish(1, &[first.clone()], "test").await.is_err());
+
+        second_task.abort();
+        let _ = second_task.await;
+        runtime.refresh().await.unwrap();
+        let (journal, state) = runtime.status().await.unwrap();
+        assert_eq!(journal.current.nodes, vec![second.clone()]);
+        assert_eq!(state.state, "unavailable");
+        assert_eq!(runtime.select(), None);
+        assert!(runtime.publish(2, &[second.clone()], "test").await.is_err());
+        assert_eq!(store.snapshot().await.unwrap().current.revision, 2);
+
+        let rolled_back = runtime.rollback(2, "test").await.unwrap();
+        assert_eq!(rolled_back.current.revision, 3);
+        assert_eq!(runtime.select(), Some(first.clone()));
+        let history = store.recent_probes(10).await.unwrap();
+        assert!(history.iter().any(|event| event["action"] == "publish"
+            && event["checks"][0]["healthy"] == false));
+        drop(runtime);
+        drop(store);
+
+        let store = RelayPoolStore::open(&path).await.unwrap();
+        let runtime = ManagedRelayRuntime::open(store, RelayPublicKey::parse(&key).unwrap()).await.unwrap();
+        assert_eq!(runtime.readback().unwrap().version.revision, 3);
+        assert_eq!(runtime.select(), Some(first));
+        first_task.abort();
+    }
+
+    #[tokio::test]
+    async fn one_runtime_owner_per_durable_journal() {
+        let key = base64::encode([73u8; 32]);
+        let (node, task) = native_node(key.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pool.sqlite3");
+        let store = RelayPoolStore::initialize(&path, &[node.clone()], "test").await.unwrap();
+        let first = ManagedRelayRuntime::open(store.clone(), RelayPublicKey::parse(&key).unwrap()).await.unwrap();
+        let other = RelayPoolStore::open(&path).await.unwrap();
+        assert!(ManagedRelayRuntime::open(other, RelayPublicKey::parse(&key).unwrap()).await.is_err());
+        assert_eq!(first.select(), Some(node.clone()));
+        drop(first);
+        let restarted = ManagedRelayRuntime::open(store, RelayPublicKey::parse(&key).unwrap()).await.unwrap();
+        assert_eq!(restarted.select(), Some(node));
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn restart_reconciles_pending_candidate_even_if_committed_node_is_down() {
+        let key = base64::encode([72u8; 32]);
+        let (first, first_task) = native_node(key.clone()).await;
+        let (second, second_task) = native_node(key.clone()).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("pool.sqlite3");
+        let store = RelayPoolStore::initialize(&path, &[first.clone()], "test").await.unwrap();
+        // A prepared attempt survives a process exit before confirmation.
+        let target = RelayTarget::parse(&second).unwrap();
+        hbbs::managed_relay_probe::probe(&target, &RelayPublicKey::parse(&key).unwrap()).await.unwrap();
+        store.prepare_publish(1, &[second.clone()], &[second], &[first.clone()], "test").await.unwrap();
+        first_task.abort();
+        let _ = first_task.await;
+        drop(store);
+
+        let store = RelayPoolStore::open(&path).await.unwrap();
+        let runtime = ManagedRelayRuntime::open(store, RelayPublicKey::parse(&key).unwrap()).await.unwrap();
+        let (journal, status) = runtime.status().await.unwrap();
+        assert_eq!(journal.current.revision, 1);
+        assert_eq!(journal.current.nodes, vec![first]);
+        assert!(journal.pending.is_none());
+        assert_eq!(status.state, "unavailable");
+        assert_eq!(runtime.select(), None);
+        second_task.abort();
+    }
+}

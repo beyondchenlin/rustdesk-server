@@ -1,5 +1,6 @@
 use crate::common::*;
 use crate::peer::*;
+use crate::{managed_relay_admin::ManagedRelayAdmin, managed_relay_probe::RelayPublicKey};
 use hbb_common::{
     allow_err, bail,
     bytes::{Bytes, BytesMut},
@@ -145,6 +146,7 @@ pub struct RendezvousServer {
     tx: Sender,
     relay_servers: Arc<RelayServers>,
     relay_servers0: Arc<RelayServers>,
+    managed_relays: Option<Arc<ManagedRelayAdmin>>,
     rendezvous_servers: Arc<Vec<String>>,
     inner: Arc<Inner>,
 }
@@ -194,12 +196,29 @@ impl RendezvousServer {
                     .unwrap_or_default(),
             )
         };
+        let pool_path = get_arg("bk-relay-pool");
+        let admin_token = get_arg("bk-relay-admin-token-file");
+        let managed_relays = match (pool_path.is_empty(), admin_token.is_empty()) {
+            (true, true) => None,
+            (false, false) => {
+                if !get_arg("relay-servers").is_empty() || mask.is_some() {
+                    bail!("Managed relay mode requires a single configuration source; remove legacy relay-servers and mask");
+                }
+                Some(Arc::new(ManagedRelayAdmin::open(
+                    std::path::Path::new(&pool_path),
+                    std::path::Path::new(&admin_token),
+                    RelayPublicKey::parse(&key)?,
+                ).await?))
+            }
+            _ => bail!("Managed relay mode requires both pool and administrator token file"),
+        };
         let mut rs = Self {
             tcp_punch: Arc::new(Mutex::new(HashMap::new())),
             pm,
             tx: tx.clone(),
             relay_servers: Default::default(),
             relay_servers0: Default::default(),
+            managed_relays,
             rendezvous_servers: Arc::new(rendezvous_servers),
             inner: Arc::new(Inner {
                 serial,
@@ -213,11 +232,26 @@ impl RendezvousServer {
         log::info!("mask: {:?}", rs.inner.mask);
         log::info!("local-ip: {:?}", rs.inner.local_ip);
         std::env::set_var("PORT_FOR_API", port.to_string());
-        rs.parse_relay_servers(&get_arg("relay-servers"));
+        if rs.managed_relays.is_none() {
+            rs.parse_relay_servers(&get_arg("relay-servers"));
+        }
         let mut listener = create_tcp_listener(bind_addr, port).await?;
         let mut listener2 = create_tcp_listener(bind_addr, nat_port).await?;
         let mut listener3 = create_tcp_listener(bind_addr, ws_port).await?;
         let mut listener_console = listen_console(bind_addr, nat_port as _).await?;
+        if let Some(managed) = rs.managed_relays.clone() {
+            tokio::spawn(async move {
+                let mut timer = interval(Duration::from_secs(60));
+                timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                timer.tick().await; // startup already measured the configured nodes
+                loop {
+                    timer.tick().await;
+                    if let Err(error) = managed.runtime.refresh().await {
+                        log::warn!("Managed relay health refresh failed: {error:#}");
+                    }
+                }
+            });
+        }
         log::info!("Listening on tcp/udp {}", listener.local_addr()?);
         log::info!(
             "Listening on tcp {}, extra port for NAT test",
@@ -318,7 +352,7 @@ impl RendezvousServer {
         loop {
             tokio::select! {
                 _ = timer_check_relay.tick() => {
-                    if self.relay_servers0.len() > 1 {
+                    if self.managed_relays.is_none() && self.relay_servers0.len() > 1 {
                         let rs = self.relay_servers0.clone();
                         let tx = self.tx.clone();
                         tokio::spawn(async move {
@@ -1012,6 +1046,9 @@ impl RendezvousServer {
     }
 
     fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
+        if let Some(managed) = &self.managed_relays {
+            return managed.runtime.select().unwrap_or_default();
+        }
         if self.relay_servers.is_empty() {
             return "".to_owned();
         } else if self.relay_servers.len() == 1 {
@@ -1040,6 +1077,15 @@ impl RendezvousServer {
                 )
             }
             Some("relay-servers" | "rs") => {
+                if let Some(managed) = &self.managed_relays {
+                    if fds.next().is_some() {
+                        return "Managed relay mode: use authenticated bk-remote-relayctl publish\n".to_owned();
+                    }
+                    return match managed.runtime.readback() {
+                        Ok(state) => state.eligible.join("\n"),
+                        Err(_) => "Managed relay status unavailable".to_owned(),
+                    };
+                }
                 if let Some(rs) = fds.next() {
                     self.tx.send(Data::RelayServers0(rs.to_owned())).ok();
                 } else {
@@ -1154,6 +1200,9 @@ impl RendezvousServer {
             }
             Some("always-use-relay" | "aur") => {
                 if let Some(rs) = fds.next() {
+                    if self.managed_relays.is_some() {
+                        return "Managed relay mode: ALWAYS_USE_RELAY is startup configuration\n".to_owned();
+                    }
                     if rs.to_uppercase() == "Y" {
                         ALWAYS_USE_RELAY.store(true, Ordering::SeqCst);
                     } else {
@@ -1195,6 +1244,15 @@ impl RendezvousServer {
                 let mut stream = stream;
                 let mut buffer = [0; 1024];
                 if let Ok(Ok(n)) = timeout(1000, stream.read(&mut buffer[..])).await {
+                    if let Some(managed) = &rs.managed_relays {
+                        if ManagedRelayAdmin::is_managed_prefix(&buffer[..n]) {
+                            // Never log authentication frames or administrator commands.
+                            if let Err(error) = managed.serve(stream, &buffer[..n]).await {
+                                log::warn!("Managed relay console response failed: {error:#}");
+                            }
+                            return;
+                        }
+                    }
                     if let Ok(data) = std::str::from_utf8(&buffer[..n]) {
                         let res = rs.check_cmd(data).await;
                         if let Err(err) = timeout(1000, stream.write_all(res.as_bytes()))
