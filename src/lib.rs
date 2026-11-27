@@ -3,6 +3,7 @@ pub use rendezvous_server::*;
 pub mod common;
 mod database;
 mod peer;
+mod native_presence;
 mod version;
 
 pub mod managed_relay_probe;

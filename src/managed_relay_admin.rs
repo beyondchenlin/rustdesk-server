@@ -26,7 +26,7 @@ use std::{
     path::Path,
 };
 
-pub const PREFIX: &[u8] = b"BKREL1 ";
+pub const PREFIX: &[u8] = b"BKREL2 ";
 const MAX_REQUEST: usize = 8192;
 const MAX_REPLY: usize = 256 * 1024;
 
@@ -127,6 +127,12 @@ struct Request {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ClientHello {
+    client_nonce: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Challenge {
     challenge: String,
     proof: String,
@@ -139,9 +145,9 @@ struct SignedBody {
     proof: String,
 }
 
-const CHALLENGE_DOMAIN: &[u8] = b"BKREL1-server";
-const REQUEST_DOMAIN: &[u8] = b"BKREL1-request";
-const REPLY_DOMAIN: &[u8] = b"BKREL1-reply";
+const CHALLENGE_DOMAIN: &[u8] = b"BKREL2-server";
+const REQUEST_DOMAIN: &[u8] = b"BKREL2-request";
+const REPLY_DOMAIN: &[u8] = b"BKREL2-reply";
 
 pub struct ManagedRelayAdmin {
     pub runtime: ManagedRelayRuntime,
@@ -202,14 +208,17 @@ impl ManagedRelayAdmin {
             bail!("Managed relay console is local only");
         }
         let hello = timeout(Duration::from_secs(2), read_frame(&mut stream, first)).await??;
-        if hello != b"challenge" {
-            bail!("Managed relay challenge required");
-        }
+        let hello: ClientHello = serde_json::from_slice(&hello)
+            .map_err(|_| anyhow!("Managed relay client nonce required"))?;
+        let client_nonce: [u8; 32] = base64::decode(&hello.client_nonce)
+            .map_err(|_| anyhow!("Invalid managed relay client nonce"))?
+            .try_into()
+            .map_err(|_| anyhow!("Invalid managed relay client nonce"))?;
         let mut challenge = [0u8; 32];
         sodiumoxide::randombytes::randombytes_into(&mut challenge);
         let hello = Challenge {
             challenge: base64::encode(challenge),
-            proof: self.token.sign(CHALLENGE_DOMAIN, &challenge, b""),
+            proof: self.token.sign(CHALLENGE_DOMAIN, &challenge, &client_nonce),
         };
         write_frame(&mut stream, &serde_json::to_vec(&hello)?, MAX_REQUEST).await?;
         let result = async {
@@ -296,10 +305,15 @@ pub async fn request_local(
         actor: actor.to_owned(),
         command,
     })?;
+    let mut client_nonce = [0u8; 32];
+    sodiumoxide::randombytes::randombytes_into(&mut client_nonce);
     let reply = timeout(Duration::from_secs(120), async {
         let address = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
         let mut stream = TcpStream::connect(address).await?;
-        write_frame(&mut stream, b"challenge", MAX_REQUEST).await?;
+        let hello = serde_json::to_vec(&ClientHello {
+            client_nonce: base64::encode(client_nonce),
+        })?;
+        write_frame(&mut stream, &hello, MAX_REQUEST).await?;
         let bytes = timeout(Duration::from_secs(2), read_frame(&mut stream, &[])).await??;
         let hello: Challenge = serde_json::from_slice(&bytes)
             .map_err(|_| anyhow!("Invalid local relay server challenge"))?;
@@ -307,7 +321,7 @@ pub async fn request_local(
             .map_err(|_| anyhow!("Invalid local relay server challenge"))?
             .try_into()
             .map_err(|_| anyhow!("Invalid local relay server challenge"))?;
-        if !token.verify(CHALLENGE_DOMAIN, &challenge, b"", &hello.proof) {
+        if !token.verify(CHALLENGE_DOMAIN, &challenge, &client_nonce, &hello.proof) {
             bail!("Local relay server authentication failed");
         }
         let signed = SignedBody {
@@ -376,11 +390,47 @@ mod tests {
         }
     }
 
+    #[hbb_common::tokio::test]
+    async fn client_rejects_replayed_server_challenge_and_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("admin.token");
+        AdminToken::create(&path).unwrap();
+        let token = AdminToken::read(&path).unwrap();
+        let captured = AdminToken::read(&path).unwrap();
+        let listener = hbb_common::tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // A fake local server replays a previously authentic transcript.
+        // It has no credential and cannot answer a fresh client nonce.
+        let challenge = [29u8; 32];
+        let hello = serde_json::to_vec(&Challenge {
+            challenge: base64::encode(challenge),
+            proof: captured.sign(CHALLENGE_DOMAIN, &challenge, b""),
+        }).unwrap();
+        let body = serde_json::to_string(&json!({"ok": true, "data": "stale"})).unwrap();
+        let reply = serde_json::to_vec(&SignedBody {
+            proof: captured.sign(REPLY_DOMAIN, &challenge, body.as_bytes()),
+            body,
+        }).unwrap();
+        drop(captured);
+        let fake = hbb_common::tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await?;
+            read_frame(&mut stream, &[]).await?;
+            write_frame(&mut stream, &hello, MAX_REQUEST).await?;
+            read_frame(&mut stream, &[]).await?;
+            write_frame(&mut stream, &reply, MAX_REPLY).await
+        });
+        let result = request_local(port, &token, "test", AdminCommand::Status).await;
+        let _ = fake.await;
+        assert!(result.is_err(), "replayed server transcript was accepted");
+    }
+
     #[test]
     fn managed_prefix_does_not_reinterpret_legacy_commands() {
         assert!(ManagedRelayAdmin::is_managed_prefix(b"BK"));
         assert!(ManagedRelayAdmin::is_managed_prefix(PREFIX));
-        assert!(ManagedRelayAdmin::is_managed_prefix(b"BKREL1 {}"));
+        assert!(ManagedRelayAdmin::is_managed_prefix(b"BKREL2 {}"));
         assert!(!ManagedRelayAdmin::is_managed_prefix(b"rs node.example"));
         assert!(!ManagedRelayAdmin::is_managed_prefix(b""));
     }

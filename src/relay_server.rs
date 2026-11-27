@@ -1084,10 +1084,15 @@ mod managed_relay_runtime_tests {
         let store = RelayPoolStore::initialize(&path, &[first.clone()], "test").await.unwrap();
         let runtime = ManagedRelayRuntime::open(store.clone(), RelayPublicKey::parse(&key).unwrap()).await.unwrap();
         assert_eq!(runtime.select(), Some(first.clone()));
+        assert!(runtime.permits(&first));
+        assert!(!runtime.permits(&second));
+        assert!(!runtime.permits(""));
 
         let changed = runtime.publish(1, &[second.clone()], "test").await.unwrap();
         assert_eq!(changed.current.revision, 2);
         assert_eq!(runtime.select(), Some(second.clone()));
+        assert!(runtime.permits(&second));
+        assert!(!runtime.permits(&first));
         assert!(runtime.publish(1, &[first.clone()], "test").await.is_err());
 
         second_task.abort();
@@ -1097,6 +1102,7 @@ mod managed_relay_runtime_tests {
         assert_eq!(journal.current.nodes, vec![second.clone()]);
         assert_eq!(state.state, "unavailable");
         assert_eq!(runtime.select(), None);
+        assert!(!runtime.permits(&second));
         assert!(runtime.publish(2, &[second.clone()], "test").await.is_err());
         assert_eq!(store.snapshot().await.unwrap().current.revision, 2);
 

@@ -195,7 +195,8 @@ impl ManagedRelayRuntime {
             bail!("Runtime version changed before enabling routing");
         }
         state.enabled = true;
-        Ok(())
+        drop(state);
+        self.report_health_transition("recovery_required")
     }
 
     pub fn readback(&self) -> ResultType<RuntimeReadback> {
@@ -224,6 +225,20 @@ impl ManagedRelayRuntime {
             .filter(|check| check.healthy)
             .nth(index)
             .map(|check| check.endpoint.clone())
+    }
+
+    pub fn permits(&self, endpoint: &str) -> bool {
+        let Ok(target) = RelayTarget::parse(endpoint) else {
+            return false;
+        };
+        let Ok(state) = self.state.read() else {
+            return false;
+        };
+        state.enabled
+            && state.fresh()
+            && state.checks.iter().any(|check| {
+                check.healthy && check.endpoint == target.as_str()
+            })
     }
 
     pub async fn status(&self) -> ResultType<(PoolSnapshot, RuntimeReadback)> {
@@ -383,7 +398,31 @@ impl ManagedRelayRuntime {
             self.disable()?;
             bail!("Relay journal changed during health check");
         }
-        self.install(journal.current, checks, true)
+        let previous = self.readback()?.state;
+        self.install(journal.current, checks, true)?;
+        self.report_health_transition(previous)
+    }
+
+    fn report_health_transition(&self, previous: &str) -> ResultType<()> {
+        let current = self.readback()?;
+        if current.state != previous {
+            match current.state {
+                "unavailable" => hbb_common::log::error!(
+                    "Managed relay unavailable: no healthy nodes; new relay requests refused; revision {}",
+                    current.version.revision
+                ),
+                "degraded" => hbb_common::log::warn!(
+                    "Managed relay degraded: {} of {} nodes healthy; revision {}",
+                    current.eligible.len(), current.version.nodes.len(), current.version.revision
+                ),
+                "healthy" => hbb_common::log::info!(
+                    "Managed relay healthy: {} nodes; revision {}",
+                    current.eligible.len(), current.version.revision
+                ),
+                _ => {}
+            }
+        }
+        Ok(())
     }
 
     pub async fn recover(&self, actor: &str) -> ResultType<()> {

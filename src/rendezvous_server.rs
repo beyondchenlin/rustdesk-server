@@ -605,6 +605,22 @@ impl RendezvousServer {
     ) -> bool {
         if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(bytes) {
             match msg_in.union {
+                Some(rendezvous_message::Union::OnlineRequest(request))
+                    if !ws && request.id.starts_with(crate::native_presence::REQUEST_PREFIX) =>
+                {
+                    if bytes.len() > crate::native_presence::MAX_REQUEST_BYTES {
+                        return false;
+                    }
+                    match timeout(2500, self.signed_presence_response(&request)).await {
+                        Ok(Ok(response)) => {
+                            if timeout(1000, Self::send_to_sink(sink, response)).await.is_err() {
+                                log::trace!("Native registration response timed out");
+                            }
+                        }
+                        _ => log::trace!("Native registration query was refused"),
+                    }
+                    return false;
+                }
                 Some(rendezvous_message::Union::PunchHoleRequest(ph)) => {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
@@ -619,6 +635,17 @@ impl RendezvousServer {
                             "Drop RequestRelay from {addr}: {err} (length {})",
                             rf.uuid.len()
                         );
+                        return false;
+                    }
+                    if self.managed_relays.as_ref().is_some_and(|managed| {
+                        !managed.runtime.permits(&rf.relay_server)
+                    }) {
+                        let mut refusal = RendezvousMessage::new();
+                        refusal.set_relay_response(RelayResponse {
+                            refuse_reason: "Managed relay unavailable".to_owned(),
+                            ..Default::default()
+                        });
+                        Self::send_to_sink(sink, refusal).await;
                         return false;
                     }
                     // there maybe several attempt, so sink can be none
@@ -643,6 +670,19 @@ impl RendezvousServer {
                         return false;
                     }
                     let addr_b = AddrMangle::decode(&rr.socket_addr);
+                    if !rr.relay_server.is_empty()
+                        && self.managed_relays.as_ref().is_some_and(|managed| {
+                            !managed.runtime.permits(&rr.relay_server)
+                        })
+                    {
+                        let mut refusal = RendezvousMessage::new();
+                        refusal.set_punch_hole_response(PunchHoleResponse {
+                            other_failure: "Managed relay unavailable".to_owned(),
+                            ..Default::default()
+                        });
+                        allow_err!(self.send_to_tcp_sync(refusal, addr_b).await);
+                        return false;
+                    }
                     rr.socket_addr = Default::default();
                     let id = rr.id();
                     if !id.is_empty() {
@@ -760,7 +800,7 @@ impl RendezvousServer {
         let mut p = PunchHoleResponse {
             socket_addr: AddrMangle::encode(addr).into(),
             pk: self.get_pk(&phs.version, phs.id).await,
-            relay_server: phs.relay_server.clone(),
+            relay_server: self.checked_relay_candidate(phs.relay_server.clone()),
             ..Default::default()
         };
         if let Ok(t) = phs.nat_type.enum_value() {
@@ -794,7 +834,7 @@ impl RendezvousServer {
         let mut p = PunchHoleResponse {
             socket_addr: la.local_addr.clone(),
             pk: self.get_pk(&la.version, la.id).await,
-            relay_server: la.relay_server,
+            relay_server: self.checked_relay_candidate(la.relay_server),
             ..Default::default()
         };
         p.set_is_local(true);
@@ -908,6 +948,26 @@ impl RendezvousServer {
             });
             Ok((msg_out, None))
         }
+    }
+
+    async fn signed_presence_response(&self, request: &OnlineRequest) -> ResultType<RendezvousMessage> {
+        let query = crate::native_presence::NativePresenceQuery::parse(request)?;
+        let key = self.inner.sk.as_ref()
+            .ok_or_else(|| hbb_common::anyhow::anyhow!("Native registration signing key is unavailable"))?;
+        let mut states = vec![0u8; query.peers.len().div_ceil(8)];
+        for (index, id) in query.peers.iter().enumerate() {
+            if let Some(peer) = self.pm.get_in_memory(id).await {
+                if peer.read().await.last_reg_time.elapsed().as_millis() < REG_TIMEOUT as u128 {
+                    states[index / 8] |= 1 << (7 - index % 8);
+                }
+            }
+        }
+        let mut response = RendezvousMessage::new();
+        response.set_online_response(OnlineResponse {
+            states: query.signed_response(&states, key)?.into(),
+            ..Default::default()
+        });
+        Ok(response)
     }
 
     #[inline]
@@ -1043,6 +1103,16 @@ impl RendezvousServer {
         let rs = get_servers(relay_servers, "relay-servers");
         self.relay_servers0 = Arc::new(rs);
         self.relay_servers = self.relay_servers0.clone();
+    }
+
+    fn checked_relay_candidate(&self, endpoint: String) -> String {
+        if self.managed_relays.as_ref().is_some_and(|managed| {
+            !managed.runtime.permits(&endpoint)
+        }) {
+            String::new()
+        } else {
+            endpoint
+        }
     }
 
     fn get_relay_server(&self, _pa: IpAddr, _pb: IpAddr) -> String {
